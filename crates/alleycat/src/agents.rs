@@ -58,33 +58,29 @@ impl AgentManager {
                 .with_context(|| format!("creating {}", home.display()))?;
         }
 
+        let mut pi_builder = PiBridge::builder()
+            .agent_bin(snapshot.agents.pi.bin.clone())
+            .launcher(Arc::new(LocalLauncher));
+        if let Some(ref home) = codex_home {
+            pi_builder = pi_builder.codex_home(home.clone());
+        }
+        let pi_bridge = pi_builder.build().await.context("building pi bridge")?;
+
+        let mut claude_builder = ClaudeBridge::builder()
+            .agent_bin(snapshot.agents.claude.bin.clone())
+            .launcher(Arc::new(LocalLauncher))
+            .bypass_permissions(snapshot.agents.claude.bypass_permissions);
+        if let Some(ref home) = codex_home {
+            claude_builder = claude_builder.codex_home(home.clone());
+        }
+        let claude_bridge = claude_builder
+            .build()
+            .await
+            .context("building claude bridge")?;
+
         let mut bridges: HashMap<AgentKind, Arc<dyn Bridge>> = HashMap::new();
-
-        if snapshot.agents.pi.enabled {
-            let mut pi_builder = PiBridge::builder()
-                .agent_bin(snapshot.agents.pi.bin.clone())
-                .launcher(Arc::new(LocalLauncher));
-            if let Some(ref home) = codex_home {
-                pi_builder = pi_builder.codex_home(home.clone());
-            }
-            let pi_bridge = pi_builder.build().await.context("building pi bridge")?;
-            bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
-        }
-
-        if snapshot.agents.claude.enabled {
-            let mut claude_builder = ClaudeBridge::builder()
-                .agent_bin(snapshot.agents.claude.bin.clone())
-                .launcher(Arc::new(LocalLauncher))
-                .bypass_permissions(snapshot.agents.claude.bypass_permissions);
-            if let Some(ref home) = codex_home {
-                claude_builder = claude_builder.codex_home(home.clone());
-            }
-            let claude_bridge = claude_builder
-                .build()
-                .await
-                .context("building claude bridge")?;
-            bridges.insert(AgentKind::Claude, claude_bridge as Arc<dyn Bridge>);
-        }
+        bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
+        bridges.insert(AgentKind::Claude, claude_bridge as Arc<dyn Bridge>);
 
         let session_cfg = &snapshot.session;
         let registry_config = SessionRegistryConfig {
