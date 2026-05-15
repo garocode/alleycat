@@ -113,14 +113,148 @@ impl CodexUnixEndpoint {
     }
 }
 
-#[derive(Clone)]
-pub struct AgentManager {
-    config: Arc<ArcSwap<HostConfig>>,
+struct BridgeSet {
     bridges: HashMap<AgentKind, Arc<dyn Bridge>>,
     /// Opencode is built lazily because constructing it spawns the opencode
     /// child + opens an SSE subscription; we don't want to pay that cost on
     /// daemon startup if no client ever asks for opencode.
     opencode_bridge: Arc<OnceCell<Arc<OpencodeBridge>>>,
+}
+
+impl BridgeSet {
+    async fn build(
+        config: &HostConfig,
+        launch_env: &LaunchEnvironmentResolver,
+        daemon_env: &LaunchEnvironment,
+    ) -> anyhow::Result<Self> {
+        // Honor `CODEX_HOME` from the same resolved launch environment used
+        // for child processes, so bridge indexes/config and spawned agents all
+        // agree even when launchd/systemd did not inherit the user's shell env.
+        let codex_home = env_path(daemon_env, "CODEX_HOME");
+        if let Some(ref home) = codex_home {
+            tokio::fs::create_dir_all(home)
+                .await
+                .with_context(|| format!("creating {}", home.display()))?;
+        }
+
+        let base_launcher: Arc<dyn ProcessLauncher> = Arc::new(LocalLauncher);
+        let user_launcher =
+            UserEnvironmentLauncher::with_resolver(base_launcher, launch_env.clone())
+                .with_program_aliases(pi_program_aliases());
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(user_launcher);
+
+        let mut pi_builder = PiBridge::builder()
+            .agent_bin(PathBuf::from(&config.agents.pi.bin))
+            .launcher(Arc::clone(&launcher));
+        if let Some(ref home) = codex_home {
+            pi_builder = pi_builder.codex_home(home.clone());
+        }
+        let pi_bridge = pi_builder.build().await.context("building pi bridge")?;
+
+        let mut amp_builder = AmpBridge::builder()
+            .agent_bin(PathBuf::from(&config.agents.amp.bin))
+            .launcher(Arc::clone(&launcher))
+            .dangerously_allow_all(config.agents.amp.dangerously_allow_all);
+        if let Some(ref home) = codex_home {
+            amp_builder = amp_builder.codex_home(home.clone());
+        }
+        let amp_bridge = amp_builder.build().await.context("building amp bridge")?;
+
+        let mut claude_builder = ClaudeBridge::builder()
+            .agent_bin(PathBuf::from(&config.agents.claude.bin))
+            .launcher(Arc::clone(&launcher))
+            .bypass_permissions(config.agents.claude.bypass_permissions);
+        if let Some(ref home) = codex_home {
+            claude_builder = claude_builder.codex_home(home.clone());
+        }
+        let claude_bridge = claude_builder
+            .build()
+            .await
+            .context("building claude bridge")?;
+
+        let mut droid_builder = DroidBridge::builder()
+            .agent_bin(PathBuf::from(&config.agents.droid.bin))
+            .launcher(Arc::clone(&launcher));
+        if let Some(ref home) = codex_home {
+            droid_builder = droid_builder.codex_home(home.clone());
+        }
+        let droid_bridge = droid_builder
+            .build()
+            .await
+            .context("building droid bridge")?;
+
+        let devin_builder = AcpBridge::builder()
+            .agent_bin(PathBuf::from(&config.agents.devin.bin))
+            .launcher(Arc::clone(&launcher));
+        let devin_acp = devin_builder
+            .build()
+            .await
+            .context("building devin bridge")?;
+        // Wrap the generic ACP bridge so `thread/list` reads devin's local
+        // SQLite store directly; ACP `session/list` filters out
+        // untitled/low-activity sessions and the mobile UI wants everything.
+        let devin_bridge: Arc<dyn Bridge> =
+            Arc::new(DevinBridge::with_default_db(devin_acp).context("wiring devin bridge")?);
+
+        // Grok is another ACP agent; launch via `grok agent stdio`
+        // (note: unlike Devin we do not assume a sessions.db for thread/list).
+        // All Grok launch knowledge lives in `grok-bridge`.
+        // The daemon and acp-bridge stay unaware of "agent", "stdio", etc.
+        let grok_bridge = GrokBridge::build(
+            PathBuf::from(&config.agents.grok.bin),
+            config.agents.grok.no_leader,
+            config.agents.grok.model.clone(),
+            config.agents.grok.always_approve,
+            config.agents.grok.reasoning_effort.clone(),
+            Arc::clone(&launcher),
+        )
+        .await
+        .context("building grok bridge")?;
+
+        let shell_cfg = &config.agents.shell;
+        let mut shell_builder = ShellBridge::builder()
+            .shell_bin(shell_cfg.shell_bin.clone())
+            .allow_env_passthrough(shell_cfg.allow_env_passthrough);
+        if let Some(default_cwd) = shell_cfg.default_cwd.as_ref() {
+            shell_builder = shell_builder.default_cwd(default_cwd);
+        }
+        let shell_bridge = shell_builder.build();
+
+        let mut bridges: HashMap<AgentKind, Arc<dyn Bridge>> = HashMap::new();
+        bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
+        bridges.insert(AgentKind::Amp, amp_bridge as Arc<dyn Bridge>);
+        bridges.insert(AgentKind::Claude, claude_bridge as Arc<dyn Bridge>);
+        bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
+        bridges.insert(AgentKind::Devin, devin_bridge);
+        bridges.insert(AgentKind::Grok, grok_bridge);
+        bridges.insert(AgentKind::Shell, shell_bridge);
+
+        let hermes_cfg = &config.agents.hermes;
+        let hermes_bridge_cfg = HermesBridgeConfig {
+            mode: alleycat_hermes_bridge::HermesMode::Auto {
+                api_base: hermes_cfg.api_base.clone(),
+                bin: Some(hermes_cfg.bin.clone()),
+            },
+            state_dir: codex_home
+                .as_ref()
+                .map(|p| p.join("hermes-bridge").to_string_lossy().to_string()),
+        };
+        bridges.insert(
+            AgentKind::Hermes,
+            Arc::new(HermesBridge::new(hermes_bridge_cfg)) as Arc<dyn Bridge>,
+        );
+
+        Ok(Self {
+            bridges,
+            opencode_bridge: Arc::new(OnceCell::new()),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct AgentManager {
+    config: Arc<ArcSwap<HostConfig>>,
+    bridges: Arc<ArcSwap<BridgeSet>>,
     /// One daemon-owned `codex app-server` child for modes that keep a shared
     /// app-server alive (`UnixProxy` or legacy `Websocket`). Not populated when
     /// Alleycat is proxying to an externally-started Codex app-server.
@@ -141,128 +275,12 @@ pub struct AgentManager {
 
 impl AgentManager {
     pub async fn new(config: Arc<ArcSwap<HostConfig>>) -> anyhow::Result<Self> {
-        let snapshot = config.load();
+        let snapshot = config.load_full();
 
         let launch_env = LaunchEnvironmentResolver::default();
         let daemon_cwd = std::env::current_dir().ok();
         let daemon_env = launch_env.resolve(daemon_cwd.as_deref()).await;
-
-        // Honor `CODEX_HOME` from the same resolved launch environment used
-        // for child processes, so bridge indexes/config and spawned agents all
-        // agree even when launchd/systemd did not inherit the user's shell env.
-        let codex_home = env_path(&daemon_env, "CODEX_HOME");
-        if let Some(ref home) = codex_home {
-            tokio::fs::create_dir_all(home)
-                .await
-                .with_context(|| format!("creating {}", home.display()))?;
-        }
-
-        let base_launcher: Arc<dyn ProcessLauncher> = Arc::new(LocalLauncher);
-        let user_launcher =
-            UserEnvironmentLauncher::with_resolver(base_launcher, launch_env.clone())
-                .with_program_aliases(pi_program_aliases());
-        let launcher: Arc<dyn ProcessLauncher> = Arc::new(user_launcher);
-
-        let mut pi_builder = PiBridge::builder()
-            .agent_bin(PathBuf::from(&snapshot.agents.pi.bin))
-            .launcher(Arc::clone(&launcher));
-        if let Some(ref home) = codex_home {
-            pi_builder = pi_builder.codex_home(home.clone());
-        }
-        let pi_bridge = pi_builder.build().await.context("building pi bridge")?;
-
-        let mut amp_builder = AmpBridge::builder()
-            .agent_bin(PathBuf::from(&snapshot.agents.amp.bin))
-            .launcher(Arc::clone(&launcher))
-            .dangerously_allow_all(snapshot.agents.amp.dangerously_allow_all);
-        if let Some(ref home) = codex_home {
-            amp_builder = amp_builder.codex_home(home.clone());
-        }
-        let amp_bridge = amp_builder.build().await.context("building amp bridge")?;
-
-        let mut claude_builder = ClaudeBridge::builder()
-            .agent_bin(PathBuf::from(&snapshot.agents.claude.bin))
-            .launcher(Arc::clone(&launcher))
-            .bypass_permissions(snapshot.agents.claude.bypass_permissions);
-        if let Some(ref home) = codex_home {
-            claude_builder = claude_builder.codex_home(home.clone());
-        }
-        let claude_bridge = claude_builder
-            .build()
-            .await
-            .context("building claude bridge")?;
-
-        let mut droid_builder = DroidBridge::builder()
-            .agent_bin(PathBuf::from(&snapshot.agents.droid.bin))
-            .launcher(Arc::clone(&launcher));
-        if let Some(ref home) = codex_home {
-            droid_builder = droid_builder.codex_home(home.clone());
-        }
-        let droid_bridge = droid_builder
-            .build()
-            .await
-            .context("building droid bridge")?;
-
-        let devin_builder = AcpBridge::builder()
-            .agent_bin(PathBuf::from(&snapshot.agents.devin.bin))
-            .launcher(Arc::clone(&launcher));
-        let devin_acp = devin_builder
-            .build()
-            .await
-            .context("building devin bridge")?;
-        // Wrap the generic ACP bridge so `thread/list` reads devin's local
-        // SQLite store directly; ACP `session/list` filters out
-        // untitled/low-activity sessions and the mobile UI wants everything.
-        let devin_bridge: Arc<dyn Bridge> =
-            Arc::new(DevinBridge::with_default_db(devin_acp).context("wiring devin bridge")?);
-
-        // Grok is another ACP agent; launch via `grok agent stdio`
-        // (note: unlike Devin we do not assume a sessions.db for thread/list).
-        // All Grok launch knowledge lives in `grok-bridge`.
-        // The daemon and acp-bridge stay unaware of "agent", "stdio", etc.
-        let grok_bridge = GrokBridge::build(
-            PathBuf::from(&snapshot.agents.grok.bin),
-            snapshot.agents.grok.no_leader,
-            snapshot.agents.grok.model.clone(),
-            snapshot.agents.grok.always_approve,
-            snapshot.agents.grok.reasoning_effort.clone(),
-            Arc::clone(&launcher),
-        )
-        .await
-        .context("building grok bridge")?;
-
-        let shell_cfg = &snapshot.agents.shell;
-        let mut shell_builder = ShellBridge::builder()
-            .shell_bin(shell_cfg.shell_bin.clone())
-            .allow_env_passthrough(shell_cfg.allow_env_passthrough);
-        if let Some(default_cwd) = shell_cfg.default_cwd.as_ref() {
-            shell_builder = shell_builder.default_cwd(default_cwd);
-        }
-        let shell_bridge = shell_builder.build();
-
-        let mut bridges: HashMap<AgentKind, Arc<dyn Bridge>> = HashMap::new();
-        bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
-        bridges.insert(AgentKind::Amp, amp_bridge as Arc<dyn Bridge>);
-        bridges.insert(AgentKind::Claude, claude_bridge as Arc<dyn Bridge>);
-        bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
-        bridges.insert(AgentKind::Devin, devin_bridge);
-        bridges.insert(AgentKind::Grok, grok_bridge);
-        bridges.insert(AgentKind::Shell, shell_bridge);
-
-        let hermes_cfg = &snapshot.agents.hermes;
-        let hermes_bridge_cfg = HermesBridgeConfig {
-            mode: alleycat_hermes_bridge::HermesMode::Auto {
-                api_base: hermes_cfg.api_base.clone(),
-                bin: Some(hermes_cfg.bin.clone()),
-            },
-            state_dir: codex_home
-                .as_ref()
-                .map(|p| p.join("hermes-bridge").to_string_lossy().to_string()),
-        };
-        bridges.insert(
-            AgentKind::Hermes,
-            Arc::new(HermesBridge::new(hermes_bridge_cfg)) as Arc<dyn Bridge>,
-        );
+        let bridges = BridgeSet::build(&snapshot, &launch_env, &daemon_env).await?;
 
         let session_cfg = &snapshot.session;
         let registry_config = SessionRegistryConfig {
@@ -295,8 +313,7 @@ impl AgentManager {
 
         Ok(Self {
             config,
-            bridges,
-            opencode_bridge: Arc::new(OnceCell::new()),
+            bridges: Arc::new(ArcSwap::from_pointee(bridges)),
             codex_child: Arc::new(Mutex::new(None)),
             codex_mode: codex_detection.mode,
             codex_bin: codex_detection.bin,
@@ -305,6 +322,18 @@ impl AgentManager {
             session_registry,
             _reaper_handle: reaper_handle,
         })
+    }
+
+    /// Rebuild bridge pools from a freshly loaded host config while preserving
+    /// the daemon identity, Iroh listener, Codex child, and session registry.
+    /// Active streams keep their old `Arc<dyn Bridge>` until they end; new
+    /// connects use the rebuilt bridge set.
+    pub async fn reload_config(&self, config: HostConfig) -> anyhow::Result<()> {
+        let daemon_env = self.daemon_launch_env().await;
+        let bridges = BridgeSet::build(&config, &self.launch_env, &daemon_env).await?;
+        self.config.store(Arc::new(config));
+        self.bridges.store(Arc::new(bridges));
+        Ok(())
     }
 
     pub fn session_registry(&self) -> &Arc<SessionRegistry> {
@@ -319,11 +348,12 @@ impl AgentManager {
     /// on process exit, which is how we ended up with multiple
     /// `devin acp` / `grok agent stdio` zombies between restarts.
     pub async fn shutdown(&self) {
-        for (kind, bridge) in &self.bridges {
+        let bridges = self.bridges.load_full();
+        for (kind, bridge) in &bridges.bridges {
             info!(agent = agent_kind_str(*kind), "shutting down bridge");
             bridge.shutdown().await;
         }
-        if let Some(opencode) = self.opencode_bridge.get() {
+        if let Some(opencode) = bridges.opencode_bridge.get() {
             opencode.shutdown().await;
         }
         self.stop_codex_child().await;
@@ -427,9 +457,12 @@ impl AgentManager {
                     let oc = self.opencode_bridge_arc().await?;
                     oc as Arc<dyn Bridge>
                 }
-                other => self.bridges.get(&other).cloned().ok_or_else(|| {
-                    anyhow!("agent `{}` is not configured", agent_kind_str(other))
-                })?,
+                other => {
+                    let bridges = self.bridges.load_full();
+                    bridges.bridges.get(&other).cloned().ok_or_else(|| {
+                        anyhow!("agent `{}` is not configured", agent_kind_str(other))
+                    })?
+                }
             };
         alleycat_bridge_core::serve_stream_with_session(bridge, stream, session, last_seen)
             .await
@@ -910,7 +943,8 @@ impl AgentManager {
             }
             cfg.agents.opencode.bin.clone()
         };
-        let bridge = self
+        let bridges = self.bridges.load_full();
+        let bridge = bridges
             .opencode_bridge
             .get_or_try_init(|| async {
                 // `OpencodeBridgeBuilder::from_env()` reads
