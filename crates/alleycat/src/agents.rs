@@ -554,12 +554,27 @@ impl AgentManager {
     }
 
     async fn serve_codex(&self, iroh_stream: IrohStream) -> anyhow::Result<()> {
+        if let Some(tcp) = self.connect_configured_codex_ws().await {
+            return pipe_codex_tcp(iroh_stream, tcp).await;
+        }
+
         match self.codex_mode {
             CodexMode::UnixDaemon => self.serve_codex_unix_proxy(iroh_stream).await,
             CodexMode::UnixProxy => self.serve_codex_unix_proxy(iroh_stream).await,
             CodexMode::Websocket => self.serve_codex_ws(iroh_stream).await,
             CodexMode::Stdio => self.serve_codex_stdio(iroh_stream).await,
         }
+    }
+
+    async fn connect_configured_codex_ws(&self) -> Option<TcpStream> {
+        let (host, port) = {
+            let cfg = self.config.load();
+            if !cfg.agents.codex.enabled {
+                return None;
+            }
+            (cfg.agents.codex.host.clone(), cfg.agents.codex.port)
+        };
+        TcpStream::connect((host.as_str(), port)).await.ok()
     }
 
     async fn serve_codex_unix_proxy(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
@@ -611,13 +626,12 @@ impl AgentManager {
         Ok(())
     }
 
-    async fn serve_codex_ws(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
+    async fn serve_codex_ws(&self, iroh_stream: IrohStream) -> anyhow::Result<()> {
         let (host, port) = self.ensure_codex_running().await?;
-        let mut tcp = TcpStream::connect((host.as_str(), port))
+        let tcp = TcpStream::connect((host.as_str(), port))
             .await
             .with_context(|| format!("connecting to codex app-server at {host}:{port}"))?;
-        let _ = tokio::io::copy_bidirectional(&mut iroh_stream, &mut tcp).await;
-        Ok(())
+        pipe_codex_tcp(iroh_stream, tcp).await
     }
 
     /// Starts the upstream Codex app-server daemon idempotently, then uses the
@@ -1033,6 +1047,11 @@ impl AgentManager {
     }
 }
 
+async fn pipe_codex_tcp(mut iroh_stream: IrohStream, mut tcp: TcpStream) -> anyhow::Result<()> {
+    let _ = tokio::io::copy_bidirectional(&mut iroh_stream, &mut tcp).await;
+    Ok(())
+}
+
 async fn hermes_api_available(api_base: &str) -> bool {
     let url = format!("{}/health", api_base.trim_end_matches('/'));
     matches!(
@@ -1153,12 +1172,13 @@ fn codex_needs_windows_cmd_shell(bin: &Path) -> bool {
     )
 }
 
-/// Probe the user-installed Codex CLI. Prefer upstream daemon lifecycle plus
-/// Unix proxy when available, then the legacy manual Unix proxy path, then the
-/// older TCP websocket listener, and finally stdio for older CLIs. Any failure
-/// (binary missing, exec error, garbled output) makes that candidate unavailable.
-/// If no candidate can be spawned, we keep `Stdio` as the fallback mode but
-/// report codex unavailable.
+/// Probe the user-installed Codex CLI. Serve-time dispatch still prefers a
+/// configured TCP app-server that is already accepting connections. Otherwise,
+/// prefer upstream daemon lifecycle plus Unix proxy when usable, then the legacy
+/// manual Unix proxy path, then the older TCP websocket listener, and finally
+/// stdio for older CLIs. Any failure (binary missing, exec error, garbled output)
+/// makes that candidate unavailable. If no candidate can be spawned, we keep
+/// `Stdio` as the fallback mode but report codex unavailable.
 async fn detect_codex(bin: &str, env: &LaunchEnvironment) -> CodexDetection {
     let fallback_bin = PathBuf::from(bin);
     let candidates = {
@@ -1216,7 +1236,8 @@ async fn detect_codex(bin: &str, env: &LaunchEnvironment) -> CodexDetection {
         let proxy_supported = codex_app_server_proxy_supported(&candidate, env).await;
         let daemon_supported = listen_supported
             && proxy_supported
-            && codex_app_server_daemon_supported(&candidate, env).await;
+            && codex_app_server_daemon_supported(&candidate, env).await
+            && codex_app_server_daemon_install_available(&candidate, env);
         let mode = if daemon_supported {
             CodexMode::UnixDaemon
         } else if listen_supported && proxy_supported {
@@ -1268,6 +1289,40 @@ async fn codex_app_server_daemon_supported(bin: &Path, env: &LaunchEnvironment) 
         tokio::time::timeout(Duration::from_secs(5), command.status()).await,
         Ok(Ok(status)) if status.success()
     )
+}
+
+fn codex_app_server_daemon_install_available(bin: &Path, env: &LaunchEnvironment) -> bool {
+    let Some(path) = codex_managed_standalone_path(env) else {
+        warn!(
+            bin = %bin.display(),
+            "codex app-server daemon help is present, but the managed standalone install path could not be resolved; falling back to non-daemon transport"
+        );
+        return false;
+    };
+    if path.is_file() {
+        return true;
+    }
+    warn!(
+        bin = %bin.display(),
+        expected = %path.display(),
+        "codex app-server daemon help is present, but the managed standalone Codex install is missing; falling back to non-daemon transport"
+    );
+    false
+}
+
+fn codex_managed_standalone_path(env: &LaunchEnvironment) -> Option<PathBuf> {
+    let home = env_path(env, "HOME")
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))?;
+    Some(codex_managed_standalone_path_for_home(&home))
+}
+
+fn codex_managed_standalone_path_for_home(home: &Path) -> PathBuf {
+    let bin_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    home.join(".codex")
+        .join("packages")
+        .join("standalone")
+        .join("current")
+        .join(bin_name)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1624,5 +1679,20 @@ mod tests {
         assert!(codex_needs_windows_cmd_shell(Path::new("CODEX.BAT")));
         assert!(!codex_needs_windows_cmd_shell(Path::new("codex.exe")));
         assert!(!codex_needs_windows_cmd_shell(Path::new("pi.cmd")));
+    }
+
+    #[test]
+    fn codex_managed_standalone_path_matches_installer_layout() {
+        let path = codex_managed_standalone_path_for_home(Path::new("/home/developer"));
+        let expected_bin = if cfg!(windows) { "codex.exe" } else { "codex" };
+        assert_eq!(
+            path,
+            Path::new("/home/developer")
+                .join(".codex")
+                .join("packages")
+                .join("standalone")
+                .join("current")
+                .join(expected_bin)
+        );
     }
 }
