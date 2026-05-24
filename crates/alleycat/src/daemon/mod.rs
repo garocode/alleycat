@@ -246,8 +246,10 @@ async fn handle_reload(daemon: &DaemonState) -> Response {
         Ok(c) => c,
         Err(error) => return Response::err(format!("loading config: {error:#}")),
     };
-    daemon.config.store(Arc::new(new_cfg));
-    Response::ok()
+    match daemon.agents.reload_config(new_cfg).await {
+        Ok(()) => Response::ok(),
+        Err(error) => Response::err(format!("reloading agents: {error:#}")),
+    }
 }
 
 async fn handle_agents_list(daemon: &DaemonState) -> Response {
